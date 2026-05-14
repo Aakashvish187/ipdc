@@ -126,7 +126,7 @@ const QS = [
   {q:"Professional ethics involve:",o:["Honesty at workplace","Cheating","Laziness","Irresponsibility"],a:0},
   {q:"Listening is important because it:",o:["Improves understanding","Shows weakness","Creates confusion","Ends communication"],a:0},
   {q:"Leadership decision-making should be:",o:["Fair and informed","Emotional only","Random","Biased"],a:0},
-  {q:"Positive social behaviour includes:",o:["Helping others","Ignoring society","Competition only","Anger"],a:1},
+  {q:"Positive social behaviour includes:",o:["Helping others","Ignoring society","Competition only","Anger"],a:0},
   {q:"In The Pursuit of Happyness, perseverance means:",o:["Continuous effort despite hardship","Giving up","Waiting for luck","Avoiding struggle"],a:0},
   {q:"Chris Gardner's success shows importance of:",o:["Determination and resilience","Comfort zone","Wealth only","Support only"],a:0},
   {q:"Parenting responsibility shown in the movie reflects:",o:["Commitment and care","Negligence","Escape","Fear"],a:0},
@@ -135,8 +135,10 @@ const QS = [
   {q:"Integrated personality development ultimately creates:",o:["Responsible and confident individuals","Competitive individuals only","Wealthy people only","Isolated individuals"],a:0},
 ];
 
-type LeaderboardRow = { username: string; best_score: number; percentage: number; rating_icon: string; attempts: number; batch?: string; };
+type LeaderboardRow = { username: string; best_score: number; best_percentage: number; rating_icon: string; attempts: number; batch?: string; xp?: number; level?: string; };
 type StatsRow = { score: number; total: number; percentage: number; created_at: string; };
+type BattleState = 'idle'|'creating'|'joining'|'waiting_start'|'in_progress'|'waiting_result'|'complete';
+type BattleRow = { battle_code:string; creator_username:string; challenger_username?:string|null; question_indices:string; status:string; creator_score?:number|null; challenger_score?:number|null; };
 
 export default function ChessQuiz() {
   const [userId, setUserId] = useState<string | null>(null);
@@ -162,18 +164,30 @@ export default function ChessQuiz() {
   const [totalTime, setTotalTime] = useState(0);
   const timerRef = useRef<ReturnType<typeof setInterval>|null>(null);
   const totalTimerRef = useRef<ReturnType<typeof setInterval>|null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval>|null>(null);
+  const battleTimerRef = useRef<ReturnType<typeof setInterval>|null>(null);
+  const battleCodeRef = useRef('');
+  const iAmCreatorRef = useRef(false);
   // Retry mode
   const [retryIndices, setRetryIndices] = useState<number[]|null>(null);
   const [retryChosen, setRetryChosen] = useState<number[]>([]);
   const [firstScore, setFirstScore] = useState<number|null>(null);
   // Live rank
   const [liveRank, setLiveRank] = useState<string|null>(null);
-  // Battle
+  // Battle state machine
+  const [battleState, setBattleState] = useState<BattleState>('idle');
   const [showBattle, setShowBattle] = useState(false);
   const [battleCode, setBattleCode] = useState('');
+  const [battleData, setBattleData] = useState<BattleRow|null>(null);
+  const [battleQuestions, setBattleQuestions] = useState<Array<{q:string;o:string[];a:number}>>([]);
+  const [battleChosen, setBattleChosen] = useState<number[]>([]);
+  const [battleCur, setBattleCur] = useState(0);
+  const [myBattleScore, setMyBattleScore] = useState(0);
+  const [opponentScore, setOpponentScore] = useState<number|null>(null);
+  const [iAmCreator, setIAmCreator] = useState(false);
   const [battleLoading, setBattleLoading] = useState(false);
   const [battleMsg, setBattleMsg] = useState('');
-  const [joinCode, setJoinCode] = useState('');
+  const [battleTimeLeft, setBattleTimeLeft] = useState(20);
   // Stats
   const [showStats, setShowStats] = useState(false);
   const [statsData, setStatsData] = useState<StatsRow[]>([]);
@@ -182,6 +196,10 @@ export default function ChessQuiz() {
   const [xpEarned, setXpEarned] = useState(0);
   // Toast
   const [toast, setToast] = useState('');
+  // Rating modal
+  const [showRating, setShowRating] = useState(false);
+  const [userRating, setUserRating] = useState(0);
+  const [ratingSubmitted, setRatingSubmitted] = useState(false);
   // Canvas ref
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -198,10 +216,17 @@ export default function ChessQuiz() {
     if (storedBatch) setBatch(storedBatch);
     if (storedXp) setUserXp(parseInt(storedXp));
     if (storedBadges) setUserBadges(JSON.parse(storedBadges));
-    // Check battle URL param
+    // Battle URL detection — store in sessionStorage so it survives registration
     const params = new URLSearchParams(window.location.search);
     const bc = params.get('battle');
-    if (bc) { setJoinCode(bc); setShowBattle(true); }
+    if (bc) {
+      sessionStorage.setItem('pending_battle', bc);
+      setBattleCode(bc); setBattleMsg('');
+      setBattleState('joining'); setShowBattle(true);
+    } else {
+      const pending = sessionStorage.getItem('pending_battle');
+      if (pending && storedName) { setBattleCode(pending); setBattleState('joining'); setShowBattle(true); }
+    }
   }, []);
 
   // Timer effect for timed mode
@@ -233,8 +258,76 @@ export default function ChessQuiz() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, username]);
 
+  // After registration, resume any pending battle
+  useEffect(() => {
+    if (!username) return;
+    const pending = sessionStorage.getItem('pending_battle');
+    if (pending) { sessionStorage.removeItem('pending_battle'); setBattleCode(pending); setBattleState('joining'); setShowBattle(true); }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [username]);
+
+  // Sync refs for stable poll closures
+  useEffect(() => { battleCodeRef.current = battleCode; }, [battleCode]);
+  useEffect(() => { iAmCreatorRef.current = iAmCreator; }, [iAmCreator]);
+
+  // Cleanup all intervals on unmount
+  useEffect(() => () => {
+    if (pollRef.current) clearInterval(pollRef.current);
+    if (battleTimerRef.current) clearInterval(battleTimerRef.current);
+  }, []);
+
+  // finishBattle: save score then poll for opponent
+  const finishBattle = useCallback(async (score: number) => {
+    if (pollRef.current) clearInterval(pollRef.current);
+    setMyBattleScore(score);
+    setBattleState('waiting_result');
+    const field = iAmCreatorRef.current ? 'creator_score' : 'challenger_score';
+    try { await sb.from('battles').update({ [field]: score, status: 'complete' }).eq('battle_code', battleCodeRef.current); } catch (_) {}
+    const oppField = iAmCreatorRef.current ? 'challenger_score' : 'creator_score';
+    pollRef.current = setInterval(async () => {
+      const { data } = await sb.from('battles').select('creator_score,challenger_score').eq('battle_code', battleCodeRef.current).single();
+      if (data?.[oppField] !== null && data?.[oppField] !== undefined) {
+        clearInterval(pollRef.current!);
+        setOpponentScore(data[oppField]);
+        setBattleState('complete');
+      }
+    }, 3000);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sb]);
+
+  // Battle per-question 20s timer
+  useEffect(() => {
+    if (battleState !== 'in_progress') { if (battleTimerRef.current) clearInterval(battleTimerRef.current); return; }
+    if (battleTimerRef.current) clearInterval(battleTimerRef.current);
+    setBattleTimeLeft(20);
+    battleTimerRef.current = setInterval(() => {
+      setBattleTimeLeft(t => {
+        if (t <= 1) {
+          setBattleChosen(prev => { const n=[...prev]; if(n[battleCur]===-1) n[battleCur]=-2; return n; });
+          setBattleCur(c => c+1);
+          return 20;
+        }
+        return t-1;
+      });
+    }, 1000);
+    return () => { if (battleTimerRef.current) clearInterval(battleTimerRef.current); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [battleCur, battleState]);
+
+  // Battle completion detection
+  useEffect(() => {
+    if (battleState !== 'in_progress' || battleQuestions.length === 0) return;
+    if (battleCur >= battleQuestions.length) {
+      if (battleTimerRef.current) clearInterval(battleTimerRef.current);
+      const score = battleChosen.reduce((acc,v,i) => acc+(v===battleQuestions[i]?.a?1:0), 0);
+      finishBattle(score);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [battleCur]);
+
   const getRating = (s: number, t: number) => {
     const p = s / t;
+    if (s === t) return { icon: '♔', title: 'World Champion', desc: 'Perfection achieved — a historic feat.' };
     if (p >= 0.9) return { icon: '♔', title: 'Grandmaster', desc: 'A truly masterful performance.' };
     if (p >= 0.75) return { icon: '♕', title: 'International Master', desc: 'Commanding control across all positions.' };
     if (p >= 0.6) return { icon: '♖', title: 'Candidate Master', desc: 'Strong foundations, keep sharpening your game.' };
@@ -311,7 +404,28 @@ export default function ChessQuiz() {
     localStorage.setItem('chess_quiz_xp', String(newXp));
     try {
       await sb.from('scores').insert([{ user_id: userId, username, score, total, percentage: pct, rating: ratingTitle, time_taken: timeTaken || null }]);
-      await sb.from('users').update({ xp: newXp, level: getLevel(newXp).name }).eq('id', userId);
+      // Fetch current user stats then update best_score, total_attempts, avg_score
+      const { data: currentUser } = await sb
+        .from('users')
+        .select('best_score, total_attempts, avg_score')
+        .eq('id', userId)
+        .single();
+      const newBest = Math.max(currentUser?.best_score || 0, score);
+      const newAttempts = (currentUser?.total_attempts || 0) + 1;
+      const newAvg = Math.round(
+        ((currentUser?.avg_score || 0) * (newAttempts - 1) + score) / newAttempts
+      );
+      await sb
+        .from('users')
+        .update({
+          best_score: newBest,
+          total_attempts: newAttempts,
+          avg_score: newAvg,
+          last_played: new Date().toISOString().split('T')[0],
+          xp: newXp,
+          level: getLevel(newXp).name,
+        })
+        .eq('id', userId);
     } catch (err) { console.error('Score save exception:', err); }
     // Check achievements
     const newBadges = [...userBadges];
@@ -332,11 +446,14 @@ export default function ChessQuiz() {
   const fetchLeaderboard = async () => {
     setLoadingLB(true); setLbError(null);
     try {
-      let query = sb.from('leaderboard').select('username, best_score, percentage, rating_icon, attempts, batch').order('best_score', { ascending: false }).limit(20);
-      if (lbTab === 'batch' && batch) query = (sb.from('leaderboard') as any).select('username, best_score, percentage, rating_icon, attempts, batch').eq('batch', batch).order('best_score', { ascending: false }).limit(20);
+      let query = sb.from('leaderboard').select('username, best_score, best_percentage, rating_icon, attempts, batch, xp, level').order('best_score', { ascending: false }).order('best_percentage', { ascending: false }).limit(20);
+      if (lbTab === 'batch' && batch) query = (sb.from('leaderboard') as any).select('username, best_score, best_percentage, rating_icon, attempts, batch, xp, level').eq('batch', batch).order('best_score', { ascending: false }).order('best_percentage', { ascending: false }).limit(20);
       const { data, error } = await query;
       if (error) throw error;
-      setLeaderboardData(data || []);
+      const sorted = (data || []).sort((a: LeaderboardRow, b: LeaderboardRow) =>
+        b.best_score - a.best_score || b.best_percentage - a.best_percentage
+      );
+      setLeaderboardData(sorted);
     } catch (err: any) {
       setLbError('Could not load leaderboard. Check Supabase connection.');
       setLeaderboardData([]);
@@ -409,59 +526,61 @@ export default function ChessQuiz() {
 
   const createBattle = async () => {
     if (!username) return alert('Please register first');
-    setBattleLoading(true);
+    setBattleLoading(true); setBattleMsg('');
     try {
-      // Fetch creator's user id fresh from DB
-      const { data: userRow, error: userErr } = await sb
-        .from('users')
-        .select('id')
-        .eq('username', username)
-        .single();
-      if (userErr || !userRow) throw new Error('Could not find your user record. Please re-register.');
-
-      const code = Math.random().toString(36).substring(2, 8).toUpperCase();
-      const qIndices = Array.from({ length: 10 }, () => Math.floor(Math.random() * QS.length));
-      const { error } = await sb.from('battles').insert([{
-        battle_code: code,
-        question_indices: JSON.stringify(qIndices),
-        creator_id: userRow.id,
-        creator_username: username,
-        status: 'waiting',
-      }]);
+      const code = Math.random().toString(36).substring(2,8).toUpperCase();
+      const qIndices = Array.from({length:10}, () => Math.floor(Math.random()*QS.length));
+      const { data: inserted, error } = await sb.from('battles').insert([{
+        battle_code: code, question_indices: JSON.stringify(qIndices),
+        creator_username: username, status: 'waiting',
+      }]).select().single();
       if (error) throw error;
-      setBattleCode(code);
-      setBattleMsg(`Share code: ${code}\n${window.location.origin}?battle=${code}`);
-    } catch (e: any) {
-      setBattleMsg('Error: ' + (e.message || 'Something went wrong'));
-    }
+      setBattleCode(code); setBattleData(inserted); setIAmCreator(true);
+      setBattleQuestions(qIndices.map((i:number) => QS[i]));
+      setBattleState('creating');
+      // Poll every 3s for challenger joining
+      if (pollRef.current) clearInterval(pollRef.current);
+      pollRef.current = setInterval(async () => {
+        const { data } = await sb.from('battles').select('*').eq('battle_code', code).single();
+        if (data?.status === 'active' && data?.challenger_username) {
+          clearInterval(pollRef.current!);
+          setBattleData(data);
+          setBattleMsg(`🎯 ${data.challenger_username} joined! Starting...`);
+          setTimeout(() => {
+            setBattleChosen(new Array(10).fill(-1));
+            setBattleCur(0); setBattleTimeLeft(20);
+            setBattleState('in_progress'); setShowBattle(false);
+          }, 2000);
+        }
+      }, 3000);
+    } catch (e:any) { setBattleMsg('Error: '+(e.message||'Something went wrong')); }
     setBattleLoading(false);
   };
 
   const joinBattle = async (code: string) => {
-    if (!username) return alert('Please register first');
-    setBattleLoading(true);
+    if (!username) return;
+    setBattleLoading(true); setBattleMsg('');
     try {
-      // Fetch challenger's user id fresh from DB
-      const { data: userRow, error: userErr } = await sb
-        .from('users')
-        .select('id')
-        .eq('username', username)
-        .single();
-      if (userErr || !userRow) throw new Error('Could not find your user record. Please re-register.');
-
-      const { error } = await sb.from('battles')
-        .update({
-          challenger_id: userRow.id,
-          challenger_username: username,
-          status: 'active',
-        })
-        .eq('battle_code', code)
-        .eq('status', 'waiting');
-      if (error) throw error;
-      setBattleMsg(`Joined battle ${code}! Start the quiz now.`);
-    } catch (e: any) {
-      setBattleMsg('Error joining: ' + (e.message || 'Something went wrong'));
-    }
+      const { data: row, error } = await sb.from('battles').select('*').eq('battle_code', code.toUpperCase()).single();
+      if (error || !row) throw new Error('Battle not found.');
+      if (row.status === 'complete') { setBattleMsg('This battle has already finished.'); setBattleLoading(false); return; }
+      if (row.status === 'active') { setBattleMsg('Battle already in progress — too late!'); setBattleLoading(false); return; }
+      const { error: upErr } = await sb.from('battles')
+        .update({ challenger_username: username, status: 'active' })
+        .eq('battle_code', code.toUpperCase()).eq('status', 'waiting');
+      if (upErr) throw upErr;
+      const indices = JSON.parse(row.question_indices) as number[];
+      setBattleData({ ...row, challenger_username: username, status: 'active' });
+      setBattleQuestions(indices.map((i:number) => QS[i]));
+      setIAmCreator(false);
+      sessionStorage.removeItem('pending_battle');
+      setBattleMsg('✅ Joined! Starting in 2 seconds...');
+      setTimeout(() => {
+        setBattleChosen(new Array(10).fill(-1));
+        setBattleCur(0); setBattleTimeLeft(20);
+        setBattleState('in_progress'); setShowBattle(false);
+      }, 2000);
+    } catch (e:any) { setBattleMsg('Error joining: '+(e.message||'Something went wrong')); }
     setBattleLoading(false);
   };
 
@@ -532,33 +651,133 @@ export default function ChessQuiz() {
     );
   };
 
-  // ── Battle Overlay ────────────────────────────────────
+  // ── Battle Overlay (idle / creating / joining / waiting_start) ──
   const BattleOverlay = () => (
-    <div className="leaderboard-overlay" onClick={(e)=>{ if(e.target===e.currentTarget) setShowBattle(false); }}>
+    <div className="leaderboard-overlay" onClick={(e)=>{ if(e.target===e.currentTarget){ setShowBattle(false); if(battleState==='idle') setBattleState('idle'); } }}>
       <div className="leaderboard-content">
         <div className="leaderboard-header">
           <div className="leaderboard-title">⚔ Battle Mode</div>
           <button className="close-lb" onClick={()=>setShowBattle(false)}>Close</button>
         </div>
-        <div style={{ padding:'24px', textAlign:'center' }}>
-          <div style={{ fontSize:'48px', marginBottom:'12px' }}>⚔</div>
-          <p style={{ color:'var(--faint)', fontStyle:'italic', marginBottom:'20px' }}>Challenge a friend to a 10-question battle!</p>
-          <button className="reg-btn" style={{ marginBottom:'16px' }} onClick={createBattle} disabled={battleLoading}>
-            {battleLoading ? '⏳ Creating...' : '⚔ Create New Battle'}
-          </button>
-          {battleCode && (<div style={{ background:'var(--parch)', border:'1px solid var(--gold)', borderRadius:'4px', padding:'16px', marginBottom:'16px' }}>
-            <div style={{ fontFamily:'var(--font-cinzel)', fontSize:'24px', color:'var(--gold)', letterSpacing:'4px' }}>{battleCode}</div>
-            <div style={{ fontSize:'13px', color:'var(--faint)', marginTop:'8px', wordBreak:'break-all' }}>{window.location.origin}?battle={battleCode}</div>
-            <button className="nbtn" style={{ marginTop:'8px' }} onClick={()=>{ navigator.clipboard.writeText(`${window.location.origin}?battle=${battleCode}`); showToast('Link copied!'); }}>Copy Link</button>
-          </div>)}
-          {joinCode && !battleCode && (<div style={{ marginTop:'16px', padding:'12px', background:'var(--correct-bg)', border:'1px solid var(--correct-fg)', borderRadius:'4px' }}>
-            <p style={{ color:'var(--correct-fg)', fontFamily:'var(--font-cinzel)' }}>Battle Code Detected: <strong>{joinCode}</strong></p>
-            <button className="nbtn" style={{ marginTop:'10px', minWidth:'180px' }} onClick={() => joinBattle(joinCode)} disabled={battleLoading}>
-              {battleLoading ? '⏳ Joining...' : '⚔ Join This Battle'}
+        <div style={{padding:'24px',textAlign:'center'}}>
+
+          {/* IDLE — create or join */}
+          {(battleState==='idle') && (<>
+            <div style={{fontSize:'48px',marginBottom:'12px'}}>⚔</div>
+            <p style={{color:'var(--faint)',fontStyle:'italic',marginBottom:'20px'}}>Challenge a friend to a 10-question battle!</p>
+            <button className="reg-btn" style={{marginBottom:'16px'}} onClick={createBattle} disabled={battleLoading}>
+              {battleLoading?'⏳ Creating...':'⚔ Create New Battle'}
             </button>
-          </div>)}
-          {battleMsg && <div style={{ color:'var(--faint)', fontSize:'13px', marginTop:'8px', whiteSpace:'pre-line' }}>{battleMsg}</div>}
+          </>)}
+
+          {/* CREATING — show code, wait for opponent */}
+          {battleState==='creating' && (<>
+            <div style={{fontSize:'36px',marginBottom:'8px'}}>⚔</div>
+            <div style={{fontFamily:'var(--font-cinzel)',fontSize:'13px',color:'var(--faint)',marginBottom:'4px'}}>YOUR BATTLE CODE</div>
+            <div style={{fontFamily:'var(--font-cinzel)',fontSize:'36px',color:'var(--gold)',letterSpacing:'6px',marginBottom:'12px'}}>{battleCode}</div>
+            <div style={{fontSize:'12px',color:'var(--faint)',wordBreak:'break-all',marginBottom:'8px'}}>{typeof window!=='undefined'?window.location.origin:''}?battle={battleCode}</div>
+            <div style={{display:'flex',gap:'8px',justifyContent:'center',flexWrap:'wrap',marginBottom:'16px'}}>
+              <button className="nbtn" onClick={()=>{ navigator.clipboard.writeText(`${window.location.origin}?battle=${battleCode}`); showToast('Link copied!'); }}>Copy Link</button>
+              <button className="nbtn btn-whatsapp" onClick={()=>{
+                const msg=`⚔ Chess Royal Battle Challenge!\nI challenge you to an IPDC MCQ battle!\nBattle Code: ${battleCode}\nJoin here: ${window.location.origin}?battle=${battleCode}\n10 Questions · 20 seconds each · Who wins? 🏆`;
+                window.open('https://wa.me/?text='+encodeURIComponent(msg),'_blank');
+              }}>💬 WhatsApp</button>
+            </div>
+            <div style={{color:'var(--faint)',fontStyle:'italic',fontSize:'13px',animation:'pulse-icon 1.5s ease-in-out infinite'}}>⏳ Waiting for opponent{battleMsg.includes('joined')?'':' ...'}</div>
+            {battleMsg && <div style={{color:'var(--gold)',fontFamily:'var(--font-cinzel)',marginTop:'10px',fontSize:'14px'}}>{battleMsg}</div>}
+          </>)}
+
+          {/* JOINING — challenger accepts */}
+          {battleState==='joining' && (<>
+            <div style={{fontSize:'48px',marginBottom:'8px'}}>⚔</div>
+            <div style={{fontFamily:'var(--font-cinzel)',fontSize:'18px',color:'var(--gold)',marginBottom:'4px'}}>Battle Challenge!</div>
+            <p style={{color:'var(--faint)',marginBottom:'6px'}}>Battle code: <strong style={{color:'var(--gold)'}}>{battleCode}</strong></p>
+            <p style={{color:'var(--faint)',fontStyle:'italic',marginBottom:'20px',fontSize:'14px'}}>10 Questions · 20 seconds each</p>
+            <button className="reg-btn" onClick={()=>joinBattle(battleCode)} disabled={battleLoading}>
+              {battleLoading?'⏳ Joining...':'⚔ Accept & Join Battle'}
+            </button>
+            {battleMsg && <div style={{color:'var(--faint)',fontSize:'13px',marginTop:'12px',whiteSpace:'pre-line'}}>{battleMsg}</div>}
+          </>)}
+
+          {/* WAITING_START — after join, countdown */}
+          {battleState==='waiting_start' && (
+            <div style={{color:'var(--gold)',fontFamily:'var(--font-cinzel)',fontSize:'16px',padding:'20px 0'}}>
+              {battleMsg || '✅ Joined! Starting...'}
+            </div>
+          )}
         </div>
+      </div>
+    </div>
+  );
+
+  // ── Rating Modal ─────────────────────────────────────
+  const ratingFeedback: Record<number, string> = {
+    1: "We'll do better! 💪",
+    2: 'Thanks for the feedback 🙏',
+    3: 'Glad you liked it! 😊',
+    4: 'Awesome! Keep practicing! 🎯',
+    5: "You're a Grandmaster fan! ♔👑",
+  };
+
+  const submitRating = async () => {
+    if (userRating === 0) return;
+    try {
+      await sb.from('app_ratings').insert([{ username: username || 'anonymous', rating: userRating }]);
+    } catch (_) {}
+    setRatingSubmitted(true);
+    setTimeout(() => { setShowRating(false); setRatingSubmitted(false); setUserRating(0); }, 2000);
+  };
+
+  const RatingModal = () => (
+    <div style={{ position:'fixed', inset:0, background:'rgba(26,18,9,0.92)', zIndex:3000, display:'flex', alignItems:'center', justifyContent:'center', padding:'16px' }}>
+      <div style={{ background:'var(--ivory,#faf6ed)', border:'2px solid var(--gold)', borderRadius:'8px', padding:'32px 24px', maxWidth:'320px', width:'100%', position:'relative', textAlign:'center' }}>
+        <button onClick={() => { setShowRating(false); setUserRating(0); }} style={{ position:'absolute', top:'10px', right:'14px', background:'none', border:'none', fontSize:'20px', color:'var(--faint)', cursor:'pointer', lineHeight:1 }}>✕</button>
+        <div style={{ fontSize:'36px', color:'var(--gold)', marginBottom:'8px' }}>♔</div>
+        <div style={{ fontFamily:'var(--font-cinzel)', fontSize:'20px', color:'var(--rim)', fontWeight:700, marginBottom:'6px' }}>Rate Chess Royal</div>
+        <div style={{ fontStyle:'italic', color:'var(--faint)', fontSize:'14px', marginBottom:'20px' }}>How was your experience?</div>
+        {ratingSubmitted ? (
+          <div style={{ fontFamily:'var(--font-cinzel)', color:'var(--gold)', fontSize:'16px', padding:'20px 0' }}>♔ Thank you for rating!</div>
+        ) : (<>
+          <div style={{ display:'flex', justifyContent:'center', gap:'8px', marginBottom:'12px' }}>
+            {[1,2,3,4,5].map(n => (
+              <button key={n} onClick={() => setUserRating(n)}
+                style={{ background:'none', border:'none', fontSize:'36px', cursor:'pointer', color: n <= userRating ? 'var(--gold)' : '#ccc', transition:'transform 0.15s', padding:'0 2px' }}
+                onMouseEnter={e => (e.currentTarget.style.transform='scale(1.2)')}
+                onMouseLeave={e => (e.currentTarget.style.transform='scale(1)')}>
+                ★
+              </button>
+            ))}
+          </div>
+          {userRating > 0 && <div style={{ color:'var(--faint)', fontSize:'13px', marginBottom:'16px', minHeight:'18px' }}>{ratingFeedback[userRating]}</div>}
+          <button onClick={submitRating} disabled={userRating === 0}
+            style={{ width:'100%', height:'44px', background:'var(--gold)', color:'var(--rim)', border:'none', borderRadius:'4px', fontFamily:'var(--font-cinzel)', fontWeight:700, fontSize:'15px', cursor: userRating > 0 ? 'pointer' : 'not-allowed', opacity: userRating > 0 ? 1 : 0.5, marginBottom:'12px' }}>
+            Submit Rating
+          </button>
+          <button onClick={() => { setShowRating(false); setUserRating(0); }}
+            style={{ background:'none', border:'none', color:'var(--faint)', fontSize:'13px', cursor:'pointer' }}>
+            Maybe Later
+          </button>
+        </>)}
+      </div>
+    </div>
+  );
+
+  // ── Developer Footer ──────────────────────────────────
+  const DeveloperFooter = () => (
+    <div style={{ background:'var(--rim)', borderTop:'1px solid var(--gold)', padding:'12px 16px', textAlign:'center', fontFamily:'"EB Garamond", serif', marginTop:'auto' }}>
+      <div style={{ display:'flex', flexWrap:'wrap', alignItems:'center', justifyContent:'center', gap:'8px', fontSize:'13px', color:'var(--faint)' }}>
+        <span>♟ Developed with ♥ by</span>
+        <a href="https://www.instagram.com/__aakashvishwakarma__/" target="_blank" rel="noopener noreferrer"
+          style={{ color:'var(--gold)', fontWeight:700, textDecoration:'none' }}
+          onMouseEnter={e => { (e.currentTarget as HTMLAnchorElement).style.textDecoration='underline'; (e.currentTarget as HTMLAnchorElement).style.color='var(--sq-light,#e8c97a)'; }}
+          onMouseLeave={e => { (e.currentTarget as HTMLAnchorElement).style.textDecoration='none'; (e.currentTarget as HTMLAnchorElement).style.color='var(--gold)'; }}>
+          📸 Aakash Vishwakarma
+        </a>
+        <span style={{ color:'var(--border-col)' }}>·</span>
+        <button onClick={() => { setUserRating(0); setRatingSubmitted(false); setShowRating(true); }}
+          style={{ color:'var(--gold)', background:'transparent', border:'1px solid var(--gold)', padding:'3px 10px', borderRadius:'20px', fontSize:'12px', cursor:'pointer', fontFamily:'inherit' }}>
+          ★ Rate this App
+        </button>
       </div>
     </div>
   );
@@ -619,7 +838,7 @@ export default function ChessQuiz() {
                     <td style={{ fontFamily: 'var(--font-cinzel)', color: 'var(--gold2)', fontWeight: 700 }}>
                       {row.best_score}/100
                     </td>
-                    <td>{row.percentage}%</td>
+                    <td>{row.best_percentage}%</td>
                     <td>{row.rating_icon}</td>
                     <td>{row.attempts}</td>
                   </tr>
@@ -657,6 +876,8 @@ export default function ChessQuiz() {
           </div>
         </div>
         {showLeaderboard && <LeaderboardOverlay />}
+        <DeveloperFooter />
+        {showRating && <RatingModal />}
       </div>
     );
   }
@@ -723,8 +944,122 @@ export default function ChessQuiz() {
         </div>
         {showLeaderboard && <LeaderboardOverlay />}
         {showStats && <StatsOverlay />}
+        <DeveloperFooter />
+        {showRating && <RatingModal />}
       </div>
     );
+  }
+
+  // ── Battle Quiz / Waiting / Result Screen ────────────────
+  if (battleState === 'in_progress' || battleState === 'waiting_result' || battleState === 'complete') {
+    const bq = battleQuestions[battleCur] || battleQuestions[0];
+    const bAns = battleChosen[battleCur];
+    const myName = username || 'You';
+    const oppName = iAmCreator ? (battleData?.challenger_username||'Opponent') : battleData?.creator_username || 'Opponent';
+
+    if (battleState === 'in_progress' && bq) return (
+      <div className="shell">
+        {toast && <div style={{position:'fixed',bottom:'20px',left:'50%',transform:'translateX(-50%)',background:'var(--rim)',color:'var(--gold)',padding:'10px 20px',borderRadius:'6px',fontFamily:'var(--font-cinzel)',fontSize:'13px',zIndex:2000,boxShadow:'0 4px 20px rgba(0,0,0,0.4)'}}>{toast}</div>}
+        <div className="crown-bar">
+          <span className="crown-pieces">⚔ ♟ ♔ ♟ ⚔</span>
+          <div className="crown-title">Battle Mode</div>
+          <div className="crown-sub">Question {battleCur+1} of {battleQuestions.length} · {username} vs {oppName}</div>
+        </div>
+        <div style={{display:'flex',justifyContent:'center',alignItems:'center',gap:'16px',padding:'12px 16px',background:'var(--parch)',borderBottom:'1px solid var(--border-col)'}}>
+          <span style={{fontFamily:'var(--font-cinzel)',fontSize:'13px',color:'var(--gold)'}}>{battleCur+1}/{battleQuestions.length}</span>
+          <div style={{flex:1,height:'6px',background:'var(--border-col)',borderRadius:'3px'}}>
+            <div style={{height:'6px',background:'var(--gold)',borderRadius:'3px',width:`${((battleCur+1)/battleQuestions.length)*100}%`,transition:'width 0.3s'}} />
+          </div>
+        </div>
+        <div className="qbody">
+          <div className="qcard">
+            <div className="piece-bg">{PIECES[battleCur%12]}</div>
+            <div className="q-meta">
+              <div className="q-badge">{battleCur+1}</div>
+              <div className="q-text">{bq.q}</div>
+            </div>
+            <div style={{textAlign:'center',margin:'12px 0 4px'}}>
+              <svg width="70" height="70" viewBox="0 0 70 70">
+                <circle cx="35" cy="35" r="30" fill="none" stroke="var(--parch)" strokeWidth="6"/>
+                <circle cx="35" cy="35" r="30" fill="none" stroke={battleTimeLeft<=6?'var(--wrong-fg)':'var(--gold)'} strokeWidth="6"
+                  strokeDasharray={`${2*Math.PI*30}`} strokeDashoffset={`${2*Math.PI*30*(1-battleTimeLeft/20)}`}
+                  strokeLinecap="round" transform="rotate(-90 35 35)" style={{transition:'stroke-dashoffset 1s linear,stroke 0.3s'}}/>
+                <text x="35" y="40" textAnchor="middle" fill={battleTimeLeft<=6?'var(--wrong-fg)':'var(--gold)'} fontFamily="var(--font-cinzel)" fontWeight="700" fontSize="18">{battleTimeLeft}</text>
+              </svg>
+            </div>
+            <div className="opts">
+              {bq.o.map((opt,i) => {
+                let cl='opt';
+                if (bAns!==-1 && bAns!==undefined) { if(i===bq.a) cl+=' correct'; else if(i===bAns) cl+=' wrong'; }
+                return (
+                  <button key={i} className={cl} disabled={bAns!==-1 && bAns!==undefined}
+                    onClick={()=>{ if(bAns===-1||bAns===undefined){ setBattleChosen(prev=>{const n=[...prev];n[battleCur]=i;return n;}); setBattleCur(c=>c+1); } }}>
+                    <span className="opt-lbl">{LBL[i]}</span><span>{opt}</span>
+                  </button>
+                );
+              })}
+            </div>
+            {bAns!==-1 && bAns!==undefined && (
+              bAns===bq.a
+                ? <div className="chip ok">♔ &nbsp; Correct — well played!</div>
+                : <div className="chip err">♟ &nbsp; Incorrect — right answer: {bq.o[bq.a]}</div>
+            )}
+          </div>
+        </div>
+        <DeveloperFooter />
+        {showRating && <RatingModal />}
+      </div>
+    );
+
+    if (battleState === 'waiting_result') return (
+      <div className="shell">
+        <div className="crown-bar"><span className="crown-pieces">⚔ ♟ ♔</span><div className="crown-title">Battle Complete</div><div className="crown-sub">Your score: {myBattleScore}/10</div></div>
+        <div style={{textAlign:'center',padding:'60px 24px'}}>
+          <div style={{fontSize:'64px',marginBottom:'16px'}}>⏳</div>
+          <div style={{fontFamily:'var(--font-cinzel)',fontSize:'20px',color:'var(--gold)',marginBottom:'8px'}}>Waiting for {oppName}...</div>
+          <div style={{color:'var(--faint)',fontStyle:'italic',fontSize:'14px'}}>Your score: {myBattleScore}/10 saved. Polling every 3s.</div>
+        </div>
+        <DeveloperFooter />
+        {showRating && <RatingModal />}
+      </div>
+    );
+
+    if (battleState === 'complete') {
+      const myS = myBattleScore;
+      const oppS = opponentScore ?? 0;
+      const winner = myS > oppS ? 'win' : myS < oppS ? 'loss' : 'draw';
+      return (
+        <div className="shell">
+          <div className="crown-bar"><span className="crown-pieces">⚔ ♟ ♔</span><div className="crown-title">Battle Result</div></div>
+          <div style={{padding:'24px',textAlign:'center'}}>
+            <div style={{display:'grid',gridTemplateColumns:'1fr auto 1fr',gap:'16px',alignItems:'center',marginBottom:'24px'}}>
+              <div style={{background:'var(--parch)',border:'2px solid var(--gold)',borderRadius:'8px',padding:'20px 12px'}}>
+                <div style={{fontFamily:'var(--font-cinzel)',fontSize:'13px',color:'var(--faint)',marginBottom:'4px'}}>YOU</div>
+                <div style={{fontFamily:'var(--font-cinzel)',fontSize:'20px',fontWeight:700,color:'var(--gold)'}}>{myName}</div>
+                <div style={{fontSize:'36px',fontWeight:700,color:'var(--gold)',margin:'8px 0'}}>{myS}/10</div>
+                <div style={{color:'var(--faint)',fontSize:'13px'}}>{Math.round(myS/10*100)}%</div>
+              </div>
+              <div style={{fontFamily:'var(--font-cinzel)',fontSize:'20px',color:'var(--faint)'}}>vs</div>
+              <div style={{background:'var(--parch)',border:'1px solid var(--border-col)',borderRadius:'8px',padding:'20px 12px'}}>
+                <div style={{fontFamily:'var(--font-cinzel)',fontSize:'13px',color:'var(--faint)',marginBottom:'4px'}}>OPPONENT</div>
+                <div style={{fontFamily:'var(--font-cinzel)',fontSize:'20px',fontWeight:700,color:'var(--ivory)'}}>{oppName}</div>
+                <div style={{fontSize:'36px',fontWeight:700,color:'var(--ivory)',margin:'8px 0'}}>{oppS}/10</div>
+                <div style={{color:'var(--faint)',fontSize:'13px'}}>{Math.round(oppS/10*100)}%</div>
+              </div>
+            </div>
+            <div style={{fontFamily:'var(--font-cinzel)',fontSize:'28px',marginBottom:'20px',color: winner==='win'?'var(--gold)': winner==='draw'?'var(--faint)':'var(--wrong-fg)'}}>
+              {winner==='win'?'🏆 YOU WIN!': winner==='draw'?'🤝 Draw!':'😔 You Lost'}
+            </div>
+            <div style={{display:'flex',gap:'12px',justifyContent:'center',flexWrap:'wrap'}}>
+              <button className="play-again" onClick={()=>{ if(pollRef.current)clearInterval(pollRef.current); setBattleState('idle'); restart(); }}>♟ Play Again</button>
+              <button className="nbtn" onClick={()=>{ if(pollRef.current)clearInterval(pollRef.current); setBattleState('idle'); setShowBattle(true); setBattleMsg(''); setBattleCode(''); }}>⚔ New Battle</button>
+            </div>
+          </div>
+          <DeveloperFooter />
+          {showRating && <RatingModal />}
+        </div>
+      );
+    }
   }
 
   // ── Quiz / Study / Timed Screen ──────────────────────
@@ -743,7 +1078,7 @@ export default function ChessQuiz() {
         <div className="header-btn-row">
           <button className="header-action-btn" onClick={openLeaderboard}>♛ Leaderboard</button>
           <button className="header-action-btn" onClick={openStats}>📊 My Stats</button>
-          <button className="header-action-btn" onClick={()=>{ setBattleCode(''); setBattleMsg(''); setShowBattle(true); }}>⚔ Battle</button>
+          <button className="header-action-btn" onClick={()=>{ if(pollRef.current)clearInterval(pollRef.current); setBattleState('idle'); setBattleCode(''); setBattleMsg(''); setShowBattle(true); }}>⚔ Battle</button>
         </div>
       </div>
 
@@ -835,6 +1170,8 @@ export default function ChessQuiz() {
       {showLeaderboard && <LeaderboardOverlay />}
       {showStats && <StatsOverlay />}
       {showBattle && <BattleOverlay />}
+      <DeveloperFooter />
+      {showRating && <RatingModal />}
     </div>
   );
 }
