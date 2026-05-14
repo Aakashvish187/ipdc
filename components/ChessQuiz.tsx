@@ -337,8 +337,57 @@ export default function ChessQuiz() {
 
   const registerUser = async () => {
     const name = regInput.trim();
-    if (!name) return alert('Please enter a username.');
-    if (name.length < 2) return alert('Username must be at least 2 characters.');
+
+    // ── PROTECTED NAME SYSTEM ──────────────────────────────
+    const BLOCKED_WORDS = [
+      'aakash', 'akash', 'aaksh', 'aksh',
+      'aaakash', 'aaaksh', 'aakashh', 'aakush',
+      'aakaash', 'akaash', 'akaaash',
+      'vishwakarma', 'vishwakrma', 'vishwakrama',
+      'aakashvish', 'akashvish',
+    ];
+
+    const normalize = (str: string) =>
+      str.toLowerCase()
+        .replace(/[\s_\-\.@#!$%^&*()+=]/g, '')
+        .replace(/0/g, 'o').replace(/1/g, 'i').replace(/3/g, 'e')
+        .replace(/4/g, 'a').replace(/5/g, 's').replace(/@/g, 'a')
+        .trim();
+
+    const normalizedInput = normalize(name);
+    const isBlocked = BLOCKED_WORDS.some(w => normalizedInput.includes(normalize(w)));
+
+    const hasHindiAakash =
+      name.includes('आकाश') || name.includes('आकश') ||
+      name.includes('अकाश');
+
+    if (isBlocked || hasHindiAakash) {
+      setRegLoading(false);
+      alert(
+        '⚠️ Tari mashi ney chodu loda!\n\n' +
+        'This username is reserved for the developer.\n' +
+        'Please choose a completely different name.'
+      );
+      return;
+    }
+
+    if (name.length < 3) {
+      setRegLoading(false);
+      alert('Username must be at least 3 characters long.');
+      return;
+    }
+    if (name.length > 20) {
+      setRegLoading(false);
+      alert('Username must be 20 characters or less.');
+      return;
+    }
+    if (/^\d+$/.test(name)) {
+      setRegLoading(false);
+      alert('Username cannot be only numbers.');
+      return;
+    }
+    // ── END VALIDATION ────────────────────────────────────
+
     setRegLoading(true);
     try {
       // Check if user exists
