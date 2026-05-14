@@ -444,20 +444,25 @@ export default function ChessQuiz() {
   }, [userId, username, userXp, userBadges, mode, chosen, sb]);
 
   const fetchLeaderboard = async () => {
-    setLoadingLB(true); setLbError(null);
+    setLoadingLB(true);
+    setLbError(null);
     try {
-      let query = sb.from('leaderboard').select('username, best_score, best_percentage, rating_icon, attempts, batch, xp, level').order('best_score', { ascending: false }).order('best_percentage', { ascending: false }).limit(20);
-      if (lbTab === 'batch' && batch) query = (sb.from('leaderboard') as any).select('username, best_score, best_percentage, rating_icon, attempts, batch, xp, level').eq('batch', batch).order('best_score', { ascending: false }).order('best_percentage', { ascending: false }).limit(20);
-      const { data, error } = await query;
-      if (error) throw error;
-      const sorted = (data || []).sort((a: LeaderboardRow, b: LeaderboardRow) =>
-        b.best_score - a.best_score || b.best_percentage - a.best_percentage
-      );
-      setLeaderboardData(sorted);
-    } catch (err: any) {
-      setLbError('Could not load leaderboard. Check Supabase connection.');
-      setLeaderboardData([]);
-    } finally { setLoadingLB(false); }
+      const { data, error } = await sb
+        .from('leaderboard')
+        .select('*')
+        .limit(20);
+
+      if (error) {
+        console.error('LB Error:', JSON.stringify(error));
+        throw error;
+      }
+      setLeaderboardData(data || []);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : JSON.stringify(err);
+      setLbError('Error: ' + msg);
+    } finally {
+      setLoadingLB(false);
+    }
   };
 
   const openLeaderboard = () => {
@@ -806,7 +811,7 @@ export default function ChessQuiz() {
             </div>
           ) : lbError ? (
             <div style={{ textAlign: 'center', padding: '40px', color: 'var(--wrong-fg)' }}>
-              <p>{lbError}</p>
+              <p style={{ color: 'red', fontSize: '12px' }}>{lbError}</p>
               <button className="nbtn" style={{ marginTop: '16px' }} onClick={fetchLeaderboard}>Try Again</button>
             </div>
           ) : leaderboardData.length === 0 ? (
